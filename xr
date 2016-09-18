@@ -1,0 +1,225 @@
+#!/bin/sh
+
+[ -n "$OZH_INSTALL" ] && {
+  mkdir -p $OZH/bin
+  ln -sf $OZH/xr/xr $OZH/bin/; }
+
+xr(){ (
+  inroot(){
+    if [ -z "$XR_FOREIGN" ]
+    then sudo sh -c "${*}"
+    else
+      echo "INROOT{$QARCH} $@"
+      test -f $DEBIAN/bin/emu || sudo cp $(which qemu-${QARCH}-static) $DEBIAN/bin/emu
+      sudo chroot $DEBIAN /bin/emu /bin/sh -c "
+      DEBIAN_FRONTEND=noninteractive
+      export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+      export LC_ALL=C LANG=C
+      ${*}
+      exit \${?}"
+    fi; }
+
+  devscript(){
+    echo "$*" > /tmp/xrtsh
+    adb push /tmp/xrtsh /data/local/tmp/ 2>&1 | grep -v bytes
+    if adb shell which su 2>/dev/null | grep -q su
+    then adb shell su -c sh /data/local/tmp/xrtsh
+    else adb shell sh /data/local/tmp/xrtsh
+    fi; }
+
+  create(){(
+    mkdir -p $DEBIAN
+    sudo qemu-debootstrap --arch armhf --variant minbase --no-check-gpg \
+      --include=gnupg2 \
+      --exclude=acpi,acpid,aptitude,aspell,aspell-en,avahi-daemon,base-config,bin86,bind9-host,console-common,console-data,console-tools,cupsys-client,cupsys-bsd,cupsys-driver-gutenprint,cupsys-pdf,debian-faq,debian-faq-de,debian-faq-fr,debian-faq-it,debian-faq-zh-cn,dhcp,dhcp3-client,dhcp3-common,dictionaries,dnsutils,doc-debian,doc-linux-text,eject,fdutils,file,finger,foomatic-filters,gettext-base,groff,gnu-efi,grub,hplip,iamerican,ibritish,info,ispell,laptop-detect,libavahi-compat-libdnssd1,libc6-amd64,libc6-i686,libgpmg1,manpages,mtools,mtr-tiny,mutt,nano,netcat,net-tools,ncurses-term,openssl,pidentd,ppp,pppconfig,pppoe,pppoeconf,read-edid,reportbug,smclient,ssh,tasksel,vim-common,vim-tiny,wamerican,w3m,whois,zeroinstall-injector \
+      sid $DEBIAN \
+      http://127.0.0.1:3142/mirror.netcologne.de/debian || return 1
+    create_init; );}
+
+  create_init(){
+    sudo cp /etc/ld.so.conf $DEBIAN/etc/ # TODO: n-verify
+    sudo cp $(which qemu-${QARCH}-static) $DEBIAN/bin/emu
+    androidize
+    apt_setup
+    host_setup
+    user_setup
+    reduce; }
+
+
+  androidize(){ (
+    _group(){ inroot "grep -q $1 /etc/group || groupadd -g $1 $2"; }
+    _group 1001 aid_radio; _group 1002 aid_bluetooth; _group 1003 aid_graphics; _group 1004 aid_input;
+    _group 1005 aid_audio; _group 1006 aid_camera; _group 1007 aid_log; _group 1008 aid_compass; _group 1009 aid_mount;
+    _group 1010 aid_wifi; _group 1011 aid_adb; _group 1012 aid_install; _group 1013 aid_media; _group 1014 aid_dhcp;
+    _group 1015 aid_sdcard_rw; _group 1016 aid_vpn; _group 1017 aid_keystore; _group 2000 aid_shell;
+    _group 2001 aid_cache; _group 2002 aid_diag; _group 3001 aid_net_bt_admin; _group 3002 aid_net_bt;
+    _group 3003 aid_inet; _group 3004 aid_net_raw; _group 3005 aid_net_admin; _group 9998 aid_misc; ); }
+
+  apt_setup(){
+    inroot 'grep _apt /etc/passwd && deluser _apt'
+    inroot apt-key net-update
+    echo deb http://ftp.de.debian.org/debian sid main contrib non-free | sudo tee $DEBIAN/etc/apt/sources.list
+    echo 'Acquire::PDiffs "false";'   | sudo tee $DEBIAN/etc/apt/apt.conf.d/99no-pdiffs
+    echo 'Acquire::Languages "none";' | sudo tee $DEBIAN/etc/apt/apt.conf.d/99no-translations
+    echo 'Acquire::ForceIPv4 "true";' | sudo tee $DEBIAN/etc/apt/apt.conf.d/99force-ipv4
+    inroot apt update
+    inroot apt install htop strace sudo vim bash-completion; }
+
+  host_setup(){
+    echo 127.0.0.1 $DESTNAME localhost | sudo tee $DEBIAN/etc/hosts
+    echo nameserver 8.8.8.8 | sudo tee $DEBIAN/etc/resolv.conf
+    echo $DESTNAME | sudo tee $DEBIAN/etc/hostname; }
+
+  user_setup(){
+    local GROUPS=sudo,aid_inet,aid_net_raw,aid_net_admin,aid_net_bt,aid_net_bt_admin,aid_shell,aid_wifi,aid_audio,aid_graphics,aid_radio,aid_sdcard_rw
+    echo '#!/bin/sh
+    export LANG=C LC_ALL=C TERM=xterm LD_PRELOAD= HOME=/root USER=root
+    export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+    exec bash -l' | sudo tee $DEBIAN/sbin/enter-from-outer >/dev/null
+    sudo chmod a+x $DEBIAN/sbin/enter-from-outer
+    inroot adduser $DESTUSER
+    inroot usermod -a -G $GROUPS $DESTUSER; }
+
+  reduce(){
+    sudo rm -rf $DEBIAN/debootstrap $DEBIAN/etc/apt/sources.list.d/*
+    inroot apt clean
+    inroot rm -rf /var/lib/apt/lists /usr/share/locale /usr/share/zoneinfo/right /usr/share/zoneinfo/posix /usr/share/man /usr/share/doc /usr/share/doc-base /usr/share/info;
+    sudo rm -rf $DEBIAN/bin/emu; }
+
+  splashlines(){
+    awk '{printf "\x1b[2K\x1b[1G [tar] %s ...",$1}END{print "ok"}'; }
+
+  pack(){
+    local dir=$PWD
+    reduce
+    umount
+    sudo du -hs $DEBIAN
+    ( cd $DEBIAN; sudo tar cvjf $dir/xrt_$DESTNAME.tbz ./ | splashlines; )
+    sudo chown $USER xrt_$DESTNAME.tbz
+    du -h xrt_$DESTNAME.tbz; }
+
+  infect(){
+    infect_xr
+    infect_debian; }
+
+  infect_xr(){
+    adb push $0 /data/local/tmp/xr 2>&1 | grep -v bytes
+    devscript '
+    busybox printf "INSTALLING xr "
+    mount -o remount,rw /system
+    cp /data/local/tmp/xr /system/xbin/
+    busybox chmod 755 /system/xbin/xr
+    busybox sed '"'1s/.*/#!\/system\/bin\/sh/'"' /system/xbin/xr |
+      busybox tee /system/xbin/xr |
+      busybox md5sum - |
+      busybox awk \{print\ \$1\}
+    md5sum /system/xbin/xr
+    mount -o remount,ro /system
+    '; }
+
+  infect_debian(){
+    printf "COPYING debian "; adb push xrt_$DESTNAME.tbz /data/local/tmp/debian.tbz 2>&1 | grep -v bytes ; echo done
+    devscript "
+    echo INSTALLING debian
+    [ -d /debian ] || echo 'Please create/mount /debian first.'
+    cd /debian && busybox tar xjvf /data/local/tmp/debian.tbz"; }
+
+  update(){
+    printf "COPYING debian "; adb push xrt_$DESTNAME.tbz /data/local/tmp/debian.tbz 2>&1 | grep -v bytes ; echo done
+    devscript 'cd /debian; busybox tar xjvf /data/local/tmp/debian.tbz'; }
+
+  enter(){
+    [ -f /debian/dev/block/mmcblk0 ] ||
+      { printf "mounting... "; mount; echo done; }
+    exec su -c busybox chroot /debian /sbin/enter-from-outer; }
+
+  mounts(){ su -c busybox df -a 2>/dev/null | busybox awk '{print $6}'; }
+  mounted(){ mounts | grep -q "^$1$"; }
+
+  start(){
+    mount
+    su -c busybox chroot $DEBIAN /bin/sh /system/xbin/xr start-services; }
+
+  stop(){
+    su -c busybox chroot $DEBIAN /bin/sh /system/xbin/xr stop-services
+    busybox printf 'killing remaining processes .'
+    while su -c busybox fuser -k $DEBIAN
+    do busybox printf .; done; echo " done"
+    umount; }
+
+  _start_services(){ for i in $(ls /etc/init.d/*); do $i start; done; }
+  _stop_services(){  for i in $(ls /etc/init.d/*); do $i stop;  done; }
+
+  mount(){
+    for m in /sys /proc /dev /dev/pts /mnt/asec /acct /mnt/secure /mnt/obb /data /system /cache /protect_f /protect_s /storage/sdcard1; do
+      mounted $DEBIAN$m && continue
+      mounted $m        || continue
+      su -c busybox mkdir -p $DEBIAN$m && su -c busybox mount -o bind $m $DEBIAN$m
+    done
+    su -c busybox mount -o remount,suid /data; }
+
+  umount(){
+    for m in \
+      /sys/fs/cgroup /sys /proc /dev/pts /dev \
+      /mnt/asec /acct /mnt/secure /mnt/obb /data /system /cache /protect_f /protect_s /storage/sdcard1
+    do mounted $DEBIAN$m && su -c busybox umount -f $DEBIAN$m
+    done; wait; }
+
+  env_android_outer(){
+    export DEBIAN=/debian
+    export XR_OUTER=true
+    export XR_DEFAULT=enter; }
+
+  env_android_inner(){
+    export HOME=/root
+    export LD_PRELOAD=
+    export XR_INNER=true
+    export DEBIAN=/; }
+
+  env_foreign(){
+    [ -z "$DEBIAN"   ] && export DEBIAN=$HOME/android/debian
+    [ -z "$DEBARCH"  ] && export DEBARCH=armhf
+    [ -z "$QARCH"    ] && export QARCH=arm
+    [ -z "$DESTNAME" ] && export DESTNAME=momo
+    [ -z "$DESTUSER" ] && export DESTUSER=anx
+    export XR_FOREIGN=yes; }
+
+  export XR_INNER=false
+  export XR_OUTER=false
+  export XR_DEFAULT=echo
+
+  [ -z "$VERBOSE" ] && export VERBOSE=false
+
+  if [ -d /debian ]
+  then if [ -d /etc/apt ]; then env_android_inner; else env_android_outer; fi
+  elif    [ -d /etc/apt ]; then env_foreign
+  else case "$1" in
+    "-O" ) env_android_outer; shift;;
+    "-I" ) env_android_inner; shift;;
+    "-F" ) env_foreign;       shift;;
+    *) echo "ERROR: insane environment"; return 1;;
+  esac; fi
+
+  $VERBOSE && echo "D: $DEBIAN X: $XR_DEFAULT { $@ }"
+
+  case "X$1X" in
+    "XrwX" ) busybox mount -o remount,rw /system;;
+    "XroX" ) busybox mount -o remount,ro /system;;
+    "XmX" | "XmountX" ) mount;;
+    "XuX" | "XumountX" ) umount;;
+    "XsX" | "XstartX" ) start;;
+    "XqX" | "XstopX" ) stop;;
+    "XSX" | "Xstart-servicesX" ) _start_services;;
+    "XQX" | "Xstop-servicesX" )  _stop_services;;
+    "XgX" | "XgroupsX" ) androidize;;
+    "XpX" | "XpackX" ) pack;;
+    "XrX" | "XreduceX" ) reduce;;
+    "XuX" | "XupdateX" ) update;;
+    "XiX" | "XinfectX" ) infect;;
+    "XciX" | "Xcreate_initX" ) create_init;;
+    "XshX" | "XshellX" ) inroot /bin/bash;;
+    "Xu-xrX" | "Xupdate-xrX" ) infect_xr;;
+    *) $XR_DEFAULT $@;;
+  esac; ); }
+
+xr $@
